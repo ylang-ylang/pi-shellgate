@@ -1,0 +1,23 @@
+{
+  "name": "pi-shellgate",
+  "version": "0.1.0",
+  "description": "ShellGate extension for pi: route bash/read/write/edit through SSH, tmux, SSH tmux, or Docker-through-tmux backends.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ssh",
+    "tmux",
+    "docker"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/shellgate.ts"
+    ]
+  }
+}
