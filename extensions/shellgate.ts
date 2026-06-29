@@ -284,8 +284,8 @@ async function tmuxPasteText(host: string | undefined, target: string, text: str
 	await tmuxCommand(host, `tmux send-keys -t ${shellQuote(target)} Enter`);
 }
 
-const SHELLGATE_PROMPT = "SG> ";
-const SHELLGATE_CONT_PROMPT = "SG+ ";
+const SHELLGATE_PROMPT = "shellgate$ ";
+const SHELLGATE_CONT_PROMPT = "shellgate> ";
 const SHELLGATE_SETUP_NOTICE = "--- ShellGate setup ready: helpers installed; /shellgate clean removes them ---";
 
 const SHELLGATE_HELPER_SCRIPT = [
