@@ -25,6 +25,7 @@ type TmuxBackend = {
 	target: string;
 	displayTarget?: string;
 	cwd: string;
+	promptReady?: boolean;
 };
 
 type Backend = DirectBackend | TmuxBackend;
@@ -48,11 +49,10 @@ type CommandOptions = {
 const STATE_ENTRY = "shellgate-state";
 const DEFAULT_CONNECT_TIMEOUT_SECONDS = 8;
 const DEFAULT_COMMAND_TIMEOUT_SECONDS = 30;
-const TMUX_CAPTURE_START = "-100000";
 
 const connectSchema = Type.Object({
 	mode: Type.String({
-		description: "Connection mode: status, off, local, ssh, tmux, or ssh-tmux",
+		description: "Connection mode: status, clean, off, local, ssh, tmux, or ssh-tmux",
 	}),
 	host: Type.Optional(Type.String({ description: "SSH host, for ssh or ssh-tmux modes" })),
 	target: Type.Optional(Type.String({ description: "tmux session or target pane, for tmux modes" })),
@@ -233,8 +233,31 @@ async function tmuxTargetExists(host: string | undefined, target: string): Promi
 	return result.code === 0 && result.stdout.toString().trim().startsWith("%");
 }
 
-async function tmuxCapture(host: string | undefined, target: string): Promise<string> {
-	return tmuxCommand(host, `tmux capture-pane -p -S ${TMUX_CAPTURE_START} -t ${shellQuote(target)}`);
+type TmuxPanePosition = {
+	historySize: number;
+	cursorY: number;
+	absoluteLine: number;
+};
+
+async function tmuxPanePosition(host: string | undefined, target: string): Promise<TmuxPanePosition> {
+	const value = await tmuxCommand(host, `tmux display-message -p -t ${shellQuote(target)} '#{history_size} #{cursor_y}'`);
+	const [historyText, cursorText] = value.trim().split(/\s+/, 2);
+	const historySize = Number.parseInt(historyText ?? "0", 10);
+	const cursorY = Number.parseInt(cursorText ?? "0", 10);
+	const safeHistorySize = Number.isFinite(historySize) ? historySize : 0;
+	const safeCursorY = Number.isFinite(cursorY) ? cursorY : 0;
+	return {
+		historySize: safeHistorySize,
+		cursorY: safeCursorY,
+		absoluteLine: safeHistorySize + safeCursorY,
+	};
+}
+
+async function tmuxCapture(host: string | undefined, target: string, start?: TmuxPanePosition): Promise<string> {
+	if (!start) return tmuxCommand(host, `tmux capture-pane -p -S -2000 -t ${shellQuote(target)}`);
+	const current = await tmuxPanePosition(host, target);
+	const startLine = Math.max(-current.historySize, start.absoluteLine - current.historySize - 1);
+	return tmuxCommand(host, `tmux capture-pane -p -S ${startLine} -t ${shellQuote(target)}`);
 }
 
 async function tmuxPaneCwd(host: string | undefined, target: string): Promise<string> {
@@ -254,46 +277,76 @@ async function tmuxSendLiteral(host: string | undefined, target: string, literal
 	await tmuxCommand(host, `tmux send-keys -t ${shellQuote(target)} Enter`);
 }
 
-async function tmuxWriteTempScript(host: string | undefined, script: string, id: string): Promise<string> {
-	const remotePath = `/tmp/shellgate-${id}.sh`;
-	const encoded = Buffer.from(script).toString("base64");
-	await runHostChecked(
-		host,
-		`umask 077; base64 -d > ${shellQuote(remotePath)} <<'__SHELLGATE_SCRIPT__'\n${encoded}\n__SHELLGATE_SCRIPT__\nchmod 700 ${shellQuote(remotePath)}`,
-	);
-	return remotePath;
-}
-
-async function tmuxRemoveTempScript(host: string | undefined, remotePath: string): Promise<void> {
-	await runHostChecked(host, `rm -f ${shellQuote(remotePath)}`).catch(() => undefined);
-}
-
-async function tmuxRemoveStaleScripts(host: string | undefined): Promise<void> {
-	await runHostChecked(host, "find /tmp -maxdepth 1 -type f -name 'shellgate-*.sh' -mmin +10 -delete").catch(() => undefined);
-}
-
 async function tmuxPasteText(host: string | undefined, target: string, text: string, id: string): Promise<void> {
-	const bufferName = `shellgate_${id.replace(/-/g, "_")}`;
+	const bufferName = `shellgate_${id.replace(/[^A-Za-z0-9_]/g, "_")}`;
 	await runHostChecked(host, `tmux load-buffer -b ${shellQuote(bufferName)} -`, { input: text });
 	await tmuxCommand(host, `tmux paste-buffer -d -b ${shellQuote(bufferName)} -t ${shellQuote(target)}`);
 	await tmuxCommand(host, `tmux send-keys -t ${shellQuote(target)} Enter`);
 }
 
-async function tmuxRunScriptInPane(host: string | undefined, target: string, script: string, id: string): Promise<void> {
-	const paneScriptPath = `/tmp/shellgate-${id}.sh`;
-	const delimiter = `__SHELLGATE_SCRIPT_${id}__`;
-	const encoded = Buffer.from(script).toString("base64");
-	const runner = [
-		"(",
-		"umask 077",
-		`base64 -d > ${shellQuote(paneScriptPath)} <<'${delimiter}'`,
-		encoded,
-		delimiter,
-		`chmod 700 ${shellQuote(paneScriptPath)}`,
-		`"\${SHELL:-/bin/sh}" ${shellQuote(paneScriptPath)}`,
-		")",
-	].join("\n");
-	await tmuxPasteText(host, target, runner, id);
+const SHELLGATE_PROMPT = "SG> ";
+const SHELLGATE_CONT_PROMPT = "SG+ ";
+const SHELLGATE_SETUP_NOTICE = "--- ShellGate setup ready: helpers installed; /shellgate clean removes them ---";
+
+const SHELLGATE_HELPER_SCRIPT = [
+	`__sg_on(){ [ -z "\${__sg_a+x}" ]&&{ __sg_p=\${PS1-};__sg_q=\${PS2-};__sg_P=\${PROMPT-};__sg_Q=\${PROMPT2-};__sg_r=\${RPROMPT-};__sg_R=\${RPS1-};};__sg_a=1;PS1=${shellQuote(SHELLGATE_PROMPT)};PROMPT=${shellQuote(SHELLGATE_PROMPT)};PS2=${shellQuote(SHELLGATE_CONT_PROMPT)};PROMPT2=${shellQuote(SHELLGATE_CONT_PROMPT)};RPROMPT=;RPS1=;}`,
+	`__sg_off(){ [ -n "\${__sg_a+x}" ]&&{ PS1=$__sg_p;PS2=$__sg_q;PROMPT=$__sg_P;PROMPT2=$__sg_Q;RPROMPT=$__sg_r;RPS1=$__sg_R;unset __sg_p __sg_q __sg_P __sg_Q __sg_r __sg_R __sg_a;};}`,
+	`__sg_status(){ __sg_s=$?;__sg_c=$(pwd -P 2>/dev/null||pwd);__sg_b=$(printf %s "$__sg_c"|base64|tr -d '\n');printf '\n__SG_STATUS_%s__:%s:%s\n' "$1" "$__sg_s" "$__sg_b";}`,
+	`__sg_clean(){ __sg_off 2>/dev/null;unset -f __sg_on __sg_off __sg_status __sg_clean 2>/dev/null;unset __sg_p __sg_q __sg_P __sg_Q __sg_r __sg_R __sg_a __sg_s __sg_c __sg_b 2>/dev/null;}`,
+	`echo ${shellQuote(SHELLGATE_SETUP_NOTICE)}`,
+].join("\n");
+
+function promptCleanupCommand(lines = 1): string {
+	return `printf '${"\\33[1A\\33[2K".repeat(lines)}'`;
+}
+
+async function tmuxInstallPromptHelpers(host: string | undefined, target: string): Promise<void> {
+	await tmuxPasteText(host, target, SHELLGATE_HELPER_SCRIPT, `setup_${Date.now()}`);
+	await new Promise((resolve) => setTimeout(resolve, 200));
+}
+
+async function ensureTmuxPromptHelpers(backend: TmuxBackend): Promise<void> {
+	if (backend.promptReady) return;
+	await tmuxInstallPromptHelpers(backend.host, backend.target);
+	backend.promptReady = true;
+}
+
+async function tmuxCleanPromptHelpers(host: string | undefined, target: string): Promise<void> {
+	const command = `__sg_clean 2>/dev/null;unset -f __sg_on __sg_off __sg_status __sg_clean 2>/dev/null;unset __sg_p __sg_q __sg_P __sg_Q __sg_r __sg_R __sg_a __sg_s __sg_c __sg_b 2>/dev/null;${promptCleanupCommand(1)}`;
+	await tmuxSendLiteral(host, target, command);
+	await new Promise((resolve) => setTimeout(resolve, 150));
+}
+
+function stripPromptLines(body: string): string {
+	const lines = body.split("\n");
+	const firstPromptIndex = lines.findIndex((line) => line.startsWith(SHELLGATE_PROMPT) || line.startsWith(SHELLGATE_CONT_PROMPT));
+	const scopedLines = firstPromptIndex === -1 ? lines : lines.slice(firstPromptIndex);
+	const outputLines: string[] = [];
+	for (const line of scopedLines) {
+		if (line.startsWith(SHELLGATE_PROMPT) || line.startsWith(SHELLGATE_CONT_PROMPT)) continue;
+		if (line.includes(SHELLGATE_SETUP_NOTICE)) continue;
+		const statusPromptIndex = line.indexOf(`${SHELLGATE_PROMPT}__sg_status `);
+		if (statusPromptIndex !== -1) {
+			outputLines.push(line.slice(0, statusPromptIndex));
+			continue;
+		}
+		outputLines.push(line);
+	}
+	return outputLines.join("\n").replace(/^\n+/, "").replace(/\n+$/, "");
+}
+
+function extractPromptModeOutput(capture: string, id: string): { complete: false; partial: string } | { complete: true; output: string; status: number; cwd?: string } {
+	const normalized = capture.replace(/\r/g, "");
+	const statusPrefix = `__SG_STATUS_${id}__:`;
+	const statusIndex = normalized.lastIndexOf(statusPrefix);
+	const body = statusIndex === -1 ? normalized : normalized.slice(0, statusIndex);
+	const output = stripPromptLines(body);
+	if (statusIndex === -1) return { complete: false, partial: output };
+	const statusLine = normalized.slice(statusIndex + statusPrefix.length).split("\n", 1)[0]?.trim() ?? "1";
+	const [statusText, cwdB64] = statusLine.split(":", 2);
+	const status = Number.parseInt(statusText ?? "1", 10);
+	const cwd = cwdB64 ? Buffer.from(cwdB64, "base64").toString() : undefined;
+	return { complete: true, output, status: Number.isFinite(status) ? status : 1, cwd };
 }
 
 let tmuxQueue: Promise<void> = Promise.resolve();
@@ -310,22 +363,22 @@ function enqueueTmux<T>(task: () => Promise<T>): Promise<T> {
 async function runTmuxBackend(
 	backend: TmuxBackend,
 	command: string,
-	_optionsCwd: string,
+	optionsCwd: string,
 	options: CommandOptions = {},
 ): Promise<RawResult> {
 	return enqueueTmux(async () => {
+		await ensureTmuxPromptHelpers(backend);
 		const id = randomUUID().replace(/-/g, "");
-		const begin = `__SHELLGATE_BEGIN_${id}__`;
-		const endPrefix = `__SHELLGATE_END_${id}__:`;
-		const script = `__shellgate_finish() {\n\t__shellgate_status=$?\n\t__shellgate_cwd=$(pwd -P 2>/dev/null || pwd)\n\t__shellgate_cwd_b64=$(printf '%s' "$__shellgate_cwd" | base64 | tr -d '\\n')\n\tprintf '\\n${endPrefix}%s:%s\\n' "$__shellgate_status" "$__shellgate_cwd_b64"\n\trm -f "$0" 2>/dev/null || true\n\tstty echo 2>/dev/null || true\n}\ntrap __shellgate_finish EXIT\nprintf '\\n${begin}\\n'\n${command}\n`;
-
-		await tmuxSendLiteral(backend.host, backend.target, "stty -echo");
+		const targetCwd = mapPath(optionsCwd, process.cwd(), backend);
+		await tmuxSendLiteral(backend.host, backend.target, `__sg_on;${promptCleanupCommand(1)}`);
 		await new Promise((resolve) => setTimeout(resolve, 120));
-		await tmuxRunScriptInPane(backend.host, backend.target, script, id);
+		const captureStart = await tmuxPanePosition(backend.host, backend.target).catch(() => undefined);
+		const commandBlock = [`cd ${shellQuote(targetCwd)}`, command, `__sg_status ${shellQuote(id)}`].join("\n");
+		await tmuxPasteText(backend.host, backend.target, commandBlock, id);
 
 		const cleanup = async () => {
 			await tmuxCommand(backend.host, `tmux send-keys -t ${shellQuote(backend.target)} C-c`).catch(() => undefined);
-			await tmuxSendLiteral(backend.host, backend.target, "stty echo").catch(() => undefined);
+			await tmuxSendLiteral(backend.host, backend.target, `__sg_off;${promptCleanupCommand(1)}`).catch(() => undefined);
 		};
 
 		return new Promise<RawResult>((resolve, reject) => {
@@ -342,38 +395,19 @@ async function runTmuxBackend(
 			};
 
 			const finishFromCapture = async (capture: string) => {
-				const normalized = capture.replace(/\r/g, "");
-				const beginIndex = normalized.lastIndexOf(begin);
-				if (beginIndex === -1) return;
-				const outputStart = beginIndex + begin.length;
-				const endIndex = normalized.indexOf(endPrefix, outputStart);
-				if (endIndex === -1) {
-					const partial = normalized.slice(outputStart).replace(/^\n/, "");
-					if (partial.length > lastOutput.length) {
-						const delta = partial.slice(lastOutput.length);
-						lastOutput = partial;
-						options.onStdout?.(Buffer.from(delta));
-					}
-					return;
+				const parsed = extractPromptModeOutput(capture, id);
+				const currentOutput = parsed.complete ? parsed.output : parsed.partial;
+				if (currentOutput.length > lastOutput.length) {
+					options.onStdout?.(Buffer.from(currentOutput.slice(lastOutput.length)));
+					lastOutput = currentOutput;
 				}
-				let output = normalized.slice(outputStart, endIndex).replace(/^\n/, "");
-				if (output.endsWith("\n")) output = output.slice(0, -1);
-				if (output.length > lastOutput.length) {
-					options.onStdout?.(Buffer.from(output.slice(lastOutput.length)));
-				}
-				const statusLine = normalized.slice(endIndex + endPrefix.length).split("\n", 1)[0]?.trim() ?? "1";
-				const [statusText, cwdB64] = statusLine.split(":", 2);
-				const status = Number.parseInt(statusText ?? "1", 10);
-				if (cwdB64) {
-					backend.cwd = Buffer.from(cwdB64, "base64").toString() || backend.cwd;
-					await tmuxSendLiteral(backend.host, backend.target, `cd ${shellQuote(backend.cwd)}`).catch(() => undefined);
-				} else {
-					backend.cwd = await tmuxPaneCwd(backend.host, backend.target).catch(() => backend.cwd);
-				}
+				if (!parsed.complete) return;
+				if (parsed.cwd) backend.cwd = parsed.cwd;
+				await tmuxSendLiteral(backend.host, backend.target, `__sg_off;${promptCleanupCommand(1)}`).catch(() => undefined);
 				settle(() =>
 					resolve({
-						code: Number.isFinite(status) ? status : 1,
-						stdout: Buffer.from(output),
+						code: parsed.status,
+						stdout: Buffer.from(parsed.output),
 						stderr: Buffer.alloc(0),
 						killed: false,
 					}),
@@ -381,7 +415,7 @@ async function runTmuxBackend(
 			};
 
 			const poll = () => {
-				tmuxCapture(backend.host, backend.target)
+				tmuxCapture(backend.host, backend.target, captureStart)
 					.then(finishFromCapture)
 					.catch((error) => settle(() => reject(error)));
 			};
@@ -512,7 +546,6 @@ async function resolveSshCwd(host: string, path?: string): Promise<string> {
 async function activateTmux(host: string | undefined, target: string, path: string | undefined, create: boolean): Promise<TmuxBackend> {
 	let cwd = path;
 	const displayTarget = target;
-	await tmuxRemoveStaleScripts(host);
 	const exists = await tmuxTargetExists(host, target);
 	if (!exists) {
 		if (!create) throw new Error(`tmux target not found: ${target}`);
@@ -530,12 +563,14 @@ async function activateTmux(host: string | undefined, target: string, path: stri
 		cwd = await tmuxPaneCwd(host, stableTarget);
 	}
 	await tmuxCommand(host, `tmux set-option -t ${shellQuote(target)} history-limit 100000`).catch(() => undefined);
+	await tmuxInstallPromptHelpers(host, stableTarget);
 	const backend: TmuxBackend = {
 		kind: "tmux",
 		host,
 		target: stableTarget,
 		displayTarget,
 		cwd: cwd || (await tmuxPaneCwd(host, stableTarget)),
+		promptReady: true,
 	};
 	return backend;
 }
@@ -558,6 +593,7 @@ function restoreBackend(data: unknown): Backend | null {
 			target: value.target,
 			displayTarget: typeof value.displayTarget === "string" ? value.displayTarget : undefined,
 			cwd: value.cwd,
+			promptReady: false,
 		};
 	}
 	return null;
@@ -573,6 +609,7 @@ function commandHelp(): string {
 		"  /shellgate ssh host[:/path]",
 		"  /shellgate tmux session [/path]",
 		"  /shellgate ssh-tmux host session [/path]",
+		"  /shellgate clean",
 		"Tmux tip: prefer a user-visible/current pi tmux session or pane when the user is observing; only create a new pane/session when requested or when no suitable visible pane exists.",
 		"Docker tip: enter a container inside a user-visible tmux pane first, e.g. docker exec -it <container> bash, then /shellgate tmux <pane>; normal bash/read/write/edit run inside that container shell.",
 		"Alias: /sg",
@@ -607,6 +644,14 @@ export default function (pi: ExtensionAPI) {
 	): Promise<string> => {
 		const mode = input.mode.toLowerCase();
 		if (mode === "status") return describeBackend(activeBackend);
+		if (["clean", "cleanup"].includes(mode)) {
+			if (activeBackend?.kind !== "tmux") return "ShellGate clean is only needed for tmux backends";
+			await tmuxCleanPromptHelpers(activeBackend.host, activeBackend.target);
+			activeBackend.promptReady = false;
+			pi.appendEntry(STATE_ENTRY, serializeBackend(activeBackend));
+			ctx?.ui?.notify?.("ShellGate helper functions cleaned from tmux pane.", "info");
+			return `cleaned:${describeBackend(activeBackend)}`;
+		}
 		if (["off", "reset", "normal", "default"].includes(mode)) {
 			setBackend(null, ctx);
 			return describeBackend(null);
@@ -655,6 +700,17 @@ export default function (pi: ExtensionAPI) {
 		const [mode, ...rest] = parts;
 		if (mode === "status") {
 			ctx.ui.notify(`ShellGate: ${describeBackend(activeBackend)}`, "info");
+			return;
+		}
+		if (["clean", "cleanup"].includes(mode)) {
+			if (activeBackend?.kind !== "tmux") {
+				ctx.ui.notify("ShellGate clean is only needed for tmux backends.", "info");
+				return;
+			}
+			await tmuxCleanPromptHelpers(activeBackend.host, activeBackend.target);
+			activeBackend.promptReady = false;
+			pi.appendEntry(STATE_ENTRY, serializeBackend(activeBackend));
+			ctx.ui.notify("ShellGate helper functions cleaned from tmux pane.", "info");
 			return;
 		}
 		if (["off", "reset", "normal", "default"].includes(mode)) {
