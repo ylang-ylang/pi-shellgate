@@ -4,52 +4,64 @@ ShellGate routes normal pi tools through SSH, tmux, SSH-tmux, and Docker-through
 
 ## Tmux Backend
 
-### `exit` can close the target pane
+### `exit` and `exec` can close the target pane
 
-Current prompt-mode tmux execution pastes the command block directly into the target interactive shell:
+The tmux backend runs commands in the pane's real interactive shell so shell state behaves naturally. This means commands such as `cd`, `source`, `export`, and shell builtins affect the pane just as if the user typed them.
+
+The tradeoff is that commands which terminate or replace the current shell can close or take over the pane:
 
 ```sh
-cd '<cwd>'
-<user command>
-__sg_status '<id>'
+exit 7
+exec bash
 ```
-
-Because the user command runs in the pane's real interactive shell, commands such as `exit`, `logout`, or some `exec ...` forms can terminate that shell. When the shell exits, tmux closes the pane before ShellGate can run the status marker.
 
 Observed impact:
 
-- `exit 7` closes the target tmux pane.
-- ShellGate then reports an error such as `can't find pane: %62`.
-- This is a destructive tmux-only edge case; local and SSH backends execute commands in child processes.
+- Direct `exit` can close the target tmux pane.
+- ShellGate may then report an error such as `can't find pane: %65`.
+- This is a tmux-only edge case; local and SSH backends execute commands in child processes.
 
-Preferred fix direction:
+Recommended agent behavior:
 
-- Run user commands in a child shell inside the pane instead of the pane's parent interactive shell.
-- Preserve cwd by having the child shell report its final cwd, then applying that cwd in the parent pane shell after the child exits.
-- Avoid reintroducing the old large base64 script wrapper as the default path.
+- Do not run direct `exit` or `exec` in tmux backends unless the user explicitly asks to close or replace the pane shell.
+- To test an exit code, wrap it in a child process explicitly:
+  ```sh
+  ( exit 7 )
+  bash -lc 'exit 7'
+  ```
+
+### Interactive wait detection is conservative
+
+When a tmux command has not completed, ShellGate checks process state without parsing terminal output. It only reports a high-confidence input wait when all of these are true:
+
+- The process is a descendant of the pane shell.
+- The process is in the pane's foreground process group.
+- One of the process file descriptors points at the pane tty.
+- The process `wchan` looks input-related, such as `tty_read`, `n_tty_read`, `do_select`, `do_poll`, `ep_poll`, or `wait_woken`.
+
+This catches many direct terminal-input waits, including Python `input()`, `pdb`, and programs using `select(stdin)`. When this happens, ShellGate now returns immediately and leaves the program running in the target shell; use `shellgate_send` to send debugger/input commands. It intentionally excludes the pane shell process itself because an idle shell prompt can look like `do_poll` on the pane tty and would otherwise cause false positives. As a result, shell builtins such as `read secret` can still fall back to the normal command timeout. It also does not claim to detect every interactive prompt. For example, `sudo` may appear as `wchan=0` or `WCHAN -`, and its file descriptors may be unreadable; in that case ShellGate treats the state as unknown rather than claiming it is waiting for a password.
 
 ### Prompt/control marker collisions can hide real output
 
-The current tmux parser filters visible prompt-mode control lines so tool output stays clean. It removes lines that look like ShellGate prompts or setup/status markers, including:
+The tmux parser filters prompt-mode control lines so tool output stays clean. By default ShellGate also attempts to remove internal setup/status protocol lines from the current visible screen after they have been captured and parsed.
+
+When `SHELLGATE_DEBUG=1` is set in the pi extension process, ShellGate leaves internal protocol lines visible for debugging. The helper uses ShellGate's injected internal `__sg_debug` value, so a stale `SHELLGATE_DEBUG` variable inside the target shell should not affect hiding. Debug-visible protocol includes:
 
 ```text
 shellgate$ ...
 shellgate> ...
 --- ShellGate setup ready: helpers installed; /shellgate clean removes them ---
+shellgate$ __sg_status ...
+__SG_STATUS_...:0:...
 ```
 
 `shellgate$ ` is the primary prompt for a new command, similar to the conventional `$` prompt. `shellgate> ` is the continuation prompt used when the shell is waiting for the rest of a multiline input, similar to the conventional `>` prompt.
-
-It also truncates a line at an inline control tail such as:
-
-```text
-shellgate$ __sg_status ...
-```
 
 Observed impact:
 
 - A real program output line beginning with `shellgate$ ` or `shellgate> ` can be omitted from the tool result.
 - A real program output line containing `shellgate$ __sg_status ` can be truncated.
+- Current-screen hiding does not erase tmux scrollback/history.
 - File transfer tools are not affected in the same way; `read`, `write`, and `edit` can preserve these strings in file contents.
 
 Preferred fix direction:

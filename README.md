@@ -73,6 +73,8 @@ After that, normal `bash`, `read`, `write`, and `edit` calls run inside the cont
 - For tmux targets, ShellGate resolves the target to a stable pane id such as `%42`.
 - For SSH, OpenSSH ControlMaster settings in `~/.ssh/config` can reuse existing SSH connections automatically.
 - See `docs/known-limitations.md` for tmux backend edge cases, including `exit`, prompt marker collisions, and stderr/stdout merging.
+- See `docs/backend-modes.md` for the attach, managed, exec-observe, and best-effort mode tradeoffs.
+- See `docs/test-baseline.md` for the manual tmux regression checklist.
 
 ## Development
 
