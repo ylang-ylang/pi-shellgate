@@ -843,6 +843,7 @@ export default function (pi: ExtensionAPI) {
 			"Use shellgate_input only with an active broker-managed tmux backend.",
 			"Use it for explicit interactive programs running in the managed child pty, such as pdb, Python input(), or REPL prompts.",
 			"Do not use tmux send-keys for ShellGate-managed interactive input.",
+			"For pdb, run a file or module so stdin stays attached to the managed pty; do not launch it from stdin-consuming forms such as python - <<'PY' heredocs.",
 			"For pdb, send commands like where, n, s, c, p variable, or q with enter=true.",
 		],
 		parameters: inputSchema,
@@ -915,11 +916,13 @@ export default function (pi: ExtensionAPI) {
 			"ShellGate command forms for the user: /shellgate ssh host[:/path], /shellgate tmux session [/path] [--adopt], /shellgate ssh-tmux host session [/path] [--adopt], /shellgate tmux-managed session [/path] [--adopt], /shellgate ssh-tmux-managed host session [/path] [--adopt], /shellgate off. Alias: /sg.",
 			"All tmux modes use a broker-managed child shell. There is no tmux attach backend and no ShellGate command protocol should be injected into the user's original pane shell.",
 			"Use shellgate_input for explicit interactive input to programs running in the broker-managed child pty; do not use tmux send-keys for this.",
+			"For interactive debuggers or REPLs such as pdb, avoid stdin-consuming launchers like python - <<'PY'; run a file/module so stdin remains available for shellgate_input.",
 			"Use adopt=true/--adopt only for explicit foreground broker adoption of an existing pane. The original pane shell is only the broker launcher; user and agent then cowork in the broker-managed child shell.",
 		];
 		if (activeBackend) {
 			base.push(`Current ShellGate backend: ${describeBackend(activeBackend)}.`);
 			base.push("Treat the ShellGate backend as the current working environment. Prefer bash for directory listing/search because bash/read/write/edit are the routed first-class tools.");
+			base.push("When you need to inspect or edit the original local workspace instead of the active backend, switch back with shellgate_connect local/off first.");
 			return {
 				systemPrompt: event.systemPrompt.replace(
 					`Current working directory: ${localCwd}`,

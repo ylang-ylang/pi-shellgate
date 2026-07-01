@@ -144,7 +144,7 @@ Do not use direct `exit` as a routine test; direct `exit` exits the managed chil
 
 ## Interactive Programs
 
-Run:
+Run a file or module so stdin stays attached to the managed pty. Do not start interactive debuggers with stdin-consuming forms such as `python3 - <<'PY'` heredocs.
 
 ```sh
 python3 -m pdb /tmp/shellgate-broker-pdb-demo.py
