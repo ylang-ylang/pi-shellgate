@@ -6,9 +6,10 @@ Supported backends:
 
 - Local directory
 - SSH host
-- Local tmux pane/session
-- SSH tmux pane/session
-- Docker-through-tmux (`docker exec -it <container> bash/sh` inside a tmux pane)
+- Local tmux broker-managed child shell
+- SSH tmux broker-managed child shell
+
+ShellGate no longer has a tmux attach backend. All tmux modes use a broker process that owns a child pty and child shell.
 
 ## Install
 
@@ -32,8 +33,10 @@ User commands:
 /shellgate status
 /shellgate off
 /shellgate ssh host[:/path]
-/shellgate tmux session-or-pane [/path]
-/shellgate ssh-tmux host session-or-pane [/path]
+/shellgate tmux session-or-pane [/path] [--adopt]
+/shellgate ssh-tmux host session-or-pane [/path] [--adopt]
+/shellgate tmux-managed session-or-pane [/path] [--adopt]
+/shellgate ssh-tmux-managed host session-or-pane [/path] [--adopt]
 ```
 
 Alias:
@@ -48,40 +51,58 @@ Natural language should also work because the extension registers `shellgate_con
 Please ssh to 192.168.201.15:/home/ylang/project and do the rest of the work there.
 ```
 
-After connection, the agent should use ordinary tools, not wrap every command in `ssh`, `tmux`, or `docker exec`.
+After connection, the agent should use ordinary tools, not wrap every command in `ssh` or `tmux`.
 
-## Docker-through-tmux
+## Tmux Broker Mode
 
-Open or reuse a visible tmux pane and enter a container:
-
-```bash
-docker exec -it <container> bash
-# or: docker exec -it <container> sh
-```
-
-Then connect ShellGate to that pane:
+Managed tmux mode starts a ShellGate broker in a tmux pane. The broker creates a child pty and starts a real child shell, normally from `$SHELL` such as `/usr/bin/zsh`:
 
 ```text
-/shellgate tmux %42
+tmux pane
+  -> shellgate-broker.py
+      -> child pty
+          -> child shell
 ```
 
-After that, normal `bash`, `read`, `write`, and `edit` calls run inside the container shell.
+For a new managed tmux session:
+
+```text
+/shellgate tmux shellgate-managed /path
+/shellgate ssh-tmux host shellgate-managed /path
+```
+
+For an existing visible pane, use explicit adopt:
+
+```text
+/shellgate tmux %88 /path --adopt
+/shellgate ssh-tmux host %88 /path --adopt
+```
+
+Adopt starts a short launcher in the existing pane shell. The broker inherits that shell's exported environment and `$SHELL`, then user keystrokes and agent tools cowork in the broker-managed child shell. The original pane shell is not used as the command execution backend.
+
+When the agent is not running a transaction, the pty belongs to the real child shell. If the local shell is zsh, the user sees and interacts with zsh. Agent transactions briefly send internal `__SGB_*` boundaries through the child shell so ShellGate can recover exit code and cwd, then return to normal interactive shell use.
+
+For interactive programs such as `pdb`, the broker detects terminal-input waits and returns immediately without killing the program. The agent can send explicit input with `shellgate_input`, which writes through the broker socket to the child pty and returns the output delta captured after that input. It does not use `tmux send-keys` or attach helpers. When the managed shell is idle, `shellgate_input` returns `sent:false` by default instead of writing debugger commands into the shell; pass `force:true` only for intentional raw input.
 
 ## Notes
 
-- When a user is observing, ShellGate guidance tells the agent to prefer a user-visible/current pi tmux session or pane.
-- For tmux targets, ShellGate resolves the target to a stable pane id such as `%42`.
+- `tmux` and `tmux-managed` are equivalent broker-managed local tmux modes.
+- `ssh-tmux` and `ssh-tmux-managed` are equivalent broker-managed remote tmux modes.
+- `/shellgate off` clears routing and asks the active managed broker to shut down.
+- Broker launches use `--history off` by default. This only prefixes ShellGate agent transaction lines with a leading space; it does not force zsh/bash-specific shell options.
+- ShellGate does not inject the old `__sg_*` attach helper/status protocol into the user's original pane shell.
+- File tools show short labels in the managed pane, such as `[shellgate] write /path/file (4 bytes)`, and hide base64/heredoc transport.
 - For SSH, OpenSSH ControlMaster settings in `~/.ssh/config` can reuse existing SSH connections automatically.
-- See `docs/known-limitations.md` for tmux backend edge cases, including `exit`, prompt marker collisions, and stderr/stdout merging.
-- See `docs/backend-modes.md` for the attach, managed, exec-observe, and best-effort mode tradeoffs.
-- See `docs/test-baseline.md` for the manual tmux regression checklist.
+- See `docs/known-limitations.md` for current broker-mode boundaries.
+- See `docs/test-baseline.md` for the manual broker regression checklist.
 
 ## Development
 
-This is a single-file pi package:
+Core files:
 
 ```text
 extensions/shellgate.ts
+extensions/shellgate-broker.py
 package.json
 README.md
 ```

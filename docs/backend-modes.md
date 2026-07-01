@@ -1,72 +1,71 @@
 # Backend Modes
 
-ShellGate has two different goals that are easy to confuse:
+ShellGate now treats tmux as a display and transport for a broker-managed child shell. It no longer exposes an attach backend for normal tool routing.
 
-- Share the same visible shell that a user is already using.
-- Return structured tool results such as command boundary, exit code, cwd, stdout, and stderr.
+## Current Contract
 
-An existing tmux pane cannot provide both without shell cooperation. A tmux pane is a pseudo-terminal byte stream. `tmux send-keys`, `tmux paste-buffer`, `tmux capture-pane`, `tmux pipe-pane`, and tmux control mode can send input and observe terminal output, but they do not expose shell events such as command start, command completion, `$?`, parser state, or stdout/stderr identity.
+Supported execution backends:
 
-If a command must run in the existing foreground shell and ShellGate must reliably learn exit status and cwd, that shell has to cooperate. Cooperation can be an in-band helper, one-shot wrapper, prompt hook, external socket, FIFO, or broker. Without that cooperation, ShellGate can only automate terminal input and observe terminal text.
+| Backend | Structured Results | Persistent Shell | Visible Pane | Notes |
+| --- | --- | --- | --- | --- |
+| Local | Yes | No | No | Runs commands through local child processes |
+| SSH | Yes | No | No | Runs commands through SSH child processes |
+| Tmux broker | Yes | Yes, broker child shell | Yes | User and agent cowork in a broker-managed pty |
+| SSH tmux broker | Yes | Yes, remote broker child shell | Yes | Broker script is copied to the remote host |
 
-## Matrix
+All tmux command forms use the broker backend:
 
-| Mode | Shares Existing Shell State | Structured Results | Pane Display | Protocol Pollution | Runner | Best For |
-| --- | --- | --- | --- | --- | --- | --- |
-| A. Attach existing shell | Yes | Partial | Natural | Yes | No | Reusing the user's current tmux shell state |
-| B. Managed shell / broker | No, only limited env/cwd inheritance | Yes | Natural | No parent-shell protocol, but has a broker | Yes | SSH-like reliability in a visible pane |
-| C. Exec runner with observation | No | Yes | Observed pane is read-only; command output returns to tools | No pane protocol | Per command only | File ops, tests, batch commands while user debugs in tmux |
-| D. Best-effort terminal | Yes | No | Natural | No | No | Human-like typing and screen reading |
+```text
+/shellgate tmux session [/path] [--adopt]
+/shellgate tmux-managed session [/path] [--adopt]
+/shellgate ssh-tmux host session [/path] [--adopt]
+/shellgate ssh-tmux-managed host session [/path] [--adopt]
+```
 
-## A. Attach Existing Shell
+`tmux` and `ssh-tmux` are compatibility aliases for the broker-managed modes. They do not mean attach.
 
-Attach mode connects to an existing tmux pane and runs commands in that pane's foreground shell. This keeps shell state natural: `cd`, `source`, `export`, aliases, shell functions, and prompt state belong to the same shell the user sees.
+## Broker Architecture
 
-The cost is that ShellGate needs a shell-side transaction protocol. Current protocol commands include `__sg_on`, `__sg_off`, `__sg_status`, `__sg_h`, and `__sg_clean`. These commands are in-band terminal input. If they are injected while the pane foreground program is `pdb`, `python input()`, `sudo`, `vim`, a long-running process, or another interactive program, the program can consume them as user input.
+New managed tmux session:
 
-Attach mode must therefore use a single state gate for all pane writes:
+```text
+tmux pane
+  -> shellgate-broker.py
+      -> child pty
+          -> child shell
+```
 
-- `certified-shell-ready`: user commands and ShellGate protocol may be injected.
-- `interactive-wait`: only explicit interactive input, such as `shellgate_send`, may be sent.
-- `running`: no injection by default.
-- `unknown`: no injection by default.
+Existing pane adoption:
 
-The existing wchan/fd process-state logic belongs in this mode. It identifies high-confidence interactive waits by checking foreground process group, descendant relationship, file descriptors pointing at the pane tty, and input-like `/proc/<pid>/wchan` values. It is a safety boundary, not a shell parser.
+```text
+tmux pane
+  -> original shell only launches broker
+      -> shellgate-broker.py
+          -> child pty
+              -> child shell
+```
 
-Attach mode cannot reliably separate stdout and stderr because both streams have already entered the pseudo-terminal and become one terminal transcript.
+The broker opens a Unix socket for agent requests and relays the pane tty to the child pty. When no agent command is active, the child shell behaves like a normal user shell. If `$SHELL` is `/usr/bin/zsh`, the managed shell is zsh.
 
-## B. Managed Shell / Broker
+When the agent sends a transaction, the broker writes a short command block into the child shell. The block contains internal `__SGB_*` begin/status markers so ShellGate can recover command output, exit code, and cwd. File tools request hidden visible output so base64/heredoc transport is not shown in the pane.
 
-Managed mode starts a ShellGate-controlled broker or child shell in a visible pane. ShellGate owns the execution protocol and can return structured results more like SSH exec.
+Broker launches pass `--history off` by default. That setting keeps ShellGate's own command block shell-agnostic by prefixing the generated transaction line with a leading space. It does not set zsh, bash, or fish-specific history options, and strict history suppression depends on the user's shell configuration.
 
-This is cleaner for command execution but it is not the same as attaching to the user's existing parent shell. It can inherit limited state such as cwd, exported environment, terminal size, and shell path, but it cannot fully inherit aliases, shell functions, unexported variables, job tables, shell options, or in-memory prompt state. Child shell changes also do not flow back into the parent shell without additional shell cooperation.
+For interactive foreground programs, ShellGate uses broker-native `shellgate_input` to write to the child pty through the broker socket and return the output delta captured after that input. It must not use `tmux send-keys` or attach helpers for agent-driven debugging. If the child shell is idle, `shellgate_input` returns `sent:false` unless `force:true` is supplied.
 
-## C. Exec Runner With Observation
+## Environment Inheritance
 
-Exec-observe mode separates observation from execution:
+For newly created managed sessions, the broker inherits the environment of the pi extension process or remote SSH command.
 
-- The tmux pane is read-only context. ShellGate may capture screen/log output and inspect process state.
-- Agent tools execute through a structured backend such as local process, SSH exec, Docker exec, or nsenter.
-- ShellGate never sends helper commands, status markers, `cd`, prompt changes, `C-c`, or cleanup commands into the observed pane.
+For explicit `--adopt`, the broker is launched by the existing pane shell. That allows the broker and child shell to inherit exported environment variables and `$SHELL` from that pane shell. It still cannot inherit shell-private state such as aliases, functions, unexported variables, job table, shell options, or readline state.
 
-This mode is appropriate when a user is interactively debugging in a pane, for example in `pdb`, while the agent reads files, edits code, runs tests, or inspects logs through a separate exec backend. It avoids the attach-mode failure class where `__sg_status` or other internal protocol enters the debugger.
+## Removed Attach Mode
 
-The tradeoff is that exec commands do not share the observed foreground shell's internal state. They do not inherit aliases, shell functions, unexported variables, sourced virtualenv state, or current jobs from the pane shell. The configured exec cwd is used instead.
+The previous attach implementation injected helper functions and status markers into the user's original pane shell. That path is removed from the main extension:
 
-## D. Best-Effort Terminal
+- no `TmuxBackend` in `extensions/shellgate.ts`
+- no `shellgate_send` attach tool; broker-native input is `shellgate_input`
+- no `__sg_on` / `__sg_status` / `__sg_clean` setup path
+- old serialized `kind: "tmux"` state is ignored on restore
 
-Best-effort terminal mode only types into and reads from the terminal. It does not try to provide reliable command boundaries, exit codes, cwd, or stdout/stderr separation.
-
-This mode has the least machinery but does not satisfy normal `bash/read/write/edit` tool semantics. It is useful only when the goal is human-like terminal operation rather than structured execution.
-
-## Product Contract
-
-No single mode can provide all of these at once:
-
-- Existing foreground shell state.
-- Natural user interaction in the same pane.
-- Reliable command boundary, exit code, cwd, stdout, and stderr.
-- No shell-side protocol.
-- No broker or runner.
-
-ShellGate should expose the modes explicitly instead of pretending tmux attach is the same thing as SSH exec. Attach mode keeps the shared shell state and accepts a guarded shell protocol. Exec-observe mode keeps the pane clean and reliable for agent tools, but it does not share the pane shell's private state.
+This removes the class of failures where ShellGate helper/status text is consumed by `pdb`, `python input()`, `sudo`, editors, or other foreground programs in the original pane shell.

@@ -1,87 +1,63 @@
 # Known Limitations
 
-ShellGate routes normal pi tools through SSH, tmux, SSH-tmux, and Docker-through-tmux backends. The tmux backend intentionally uses a visible interactive pane, which keeps behavior close to the shell the user is watching but also creates a few known edge cases.
+ShellGate routes normal pi tools through local, SSH, and broker-managed tmux backends. The tmux backend is no longer attach mode: a broker owns a child pty and a real child shell, and all agent commands go through the broker socket.
 
-## Tmux Backend
+## Broker-Managed Tmux
 
-### `exit` and `exec` can close the target pane
+### The child shell is real, but not the original parent shell
 
-The tmux backend runs commands in the pane's real interactive shell so shell state behaves naturally. This means commands such as `cd`, `source`, `export`, and shell builtins affect the pane just as if the user typed them.
+In tmux broker mode, the user and agent cowork in the broker-managed child shell. If the broker is started from a normal pane shell with `--adopt`, the broker inherits exported environment variables and `$SHELL` from that shell. The child shell then starts as that shell, for example `/usr/bin/zsh`.
 
-The tradeoff is that commands which terminate or replace the current shell can close or take over the pane:
+This still does not share private shell state from the original parent shell:
 
-```sh
-exit 7
-exec bash
-```
+- aliases
+- shell functions
+- unexported variables
+- job table
+- shell options
+- readline state
 
-Observed impact:
+Those are process-private state in the original shell. The original shell is only the launcher for the broker.
 
-- Direct `exit` can close the target tmux pane.
-- ShellGate may then report an error such as `can't find pane: %65`.
-- This is a tmux-only edge case; local and SSH backends execute commands in child processes.
+### Agent command boundaries are internal broker protocol
 
-Recommended agent behavior:
+The old attach protocol (`__sg_on`, `__sg_status`, prompt helpers, and `shellgate_send`) has been removed from the main ShellGate path. Broker mode still needs internal boundaries to return structured tool results. Those boundaries use `__SGB_*` markers inside the managed child shell during an agent transaction.
 
-- Do not run direct `exit` or `exec` in tmux backends unless the user explicitly asks to close or replace the pane shell.
-- To test an exit code, wrap it in a child process explicitly:
-  ```sh
-  ( exit 7 )
-  bash -lc 'exit 7'
-  ```
-
-### Interactive wait detection is conservative
-
-When a tmux command has not completed, ShellGate checks process state without parsing terminal output. It only reports a high-confidence input wait when all of these are true:
-
-- The process is a descendant of the pane shell.
-- The process is in the pane's foreground process group.
-- One of the process file descriptors points at the pane tty.
-- The process `wchan` looks input-related, such as `tty_read`, `n_tty_read`, `do_select`, `do_poll`, `ep_poll`, or `wait_woken`.
-
-This catches many direct terminal-input waits, including Python `input()`, `pdb`, and programs using `select(stdin)`. When this happens, ShellGate now returns immediately and leaves the program running in the target shell; use `shellgate_send` to send debugger/input commands. It intentionally excludes the pane shell process itself because an idle shell prompt can look like `do_poll` on the pane tty and would otherwise cause false positives. As a result, shell builtins such as `read secret` can still fall back to the normal command timeout. It also does not claim to detect every interactive prompt. For example, `sudo` may appear as `wchan=0` or `WCHAN -`, and its file descriptors may be unreadable; in that case ShellGate treats the state as unknown rather than claiming it is waiting for a password.
-
-### Prompt/control marker collisions can hide real output
-
-The tmux parser filters prompt-mode control lines so tool output stays clean. By default ShellGate also attempts to remove internal setup/status protocol lines from the current visible screen after they have been captured and parsed.
-
-When `SHELLGATE_DEBUG=1` is set in the pi extension process, ShellGate leaves internal protocol lines visible for debugging. The helper uses ShellGate's injected internal `__sg_debug` value, so a stale `SHELLGATE_DEBUG` variable inside the target shell should not affect hiding. Debug-visible protocol includes:
-
-```text
-shellgate$ ...
-shellgate> ...
---- ShellGate setup ready: helpers installed; /shellgate clean removes them ---
-shellgate$ __sg_status ...
-__SG_STATUS_...:0:...
-```
-
-`shellgate$ ` is the primary prompt for a new command, similar to the conventional `$` prompt. `shellgate> ` is the continuation prompt used when the shell is waiting for the rest of a multiline input, similar to the conventional `>` prompt.
-
-Observed impact:
-
-- A real program output line beginning with `shellgate$ ` or `shellgate> ` can be omitted from the tool result.
-- A real program output line containing `shellgate$ __sg_status ` can be truncated.
-- Current-screen hiding does not erase tmux scrollback/history.
-- File transfer tools are not affected in the same way; `read`, `write`, and `edit` can preserve these strings in file contents.
-
-Preferred fix direction:
-
-- Replace fixed human-readable prompt markers with high-entropy per-session or per-command markers.
-- Filter only exact markers associated with the active command id.
-- Prefer explicit begin/end/status boundaries over broad prompt-looking line filters.
+When no agent transaction is active, broker mode relays user input and child shell output directly. The user should see the real child shell prompt and behavior.
 
 ### stdout and stderr are merged
 
-The tmux backend captures terminal output with `tmux capture-pane`. By the time output reaches the pane, stdout and stderr are already merged by the pseudo-terminal.
+The broker talks to the child shell through a pty. By the time output reaches ShellGate, stdout and stderr are merged into the terminal transcript.
 
 Observed impact:
 
-- stderr appears in the tool's output stream together with stdout.
+- stderr appears in the tool output stream together with stdout.
 - Exit codes are still captured separately.
 - This differs from local process execution, where stdout and stderr can be separated.
 
-Preferred fix direction:
+### Interactive programs run in the child shell
 
-- Keep this as a documented limitation unless strict fd separation is required.
-- If needed, execute commands through an internal child shell that redirects stdout and stderr to separate temporary files or marker-delimited channels.
-- Balance stricter fd separation against extra visible pane noise and implementation complexity.
+Programs such as `pdb`, `python input()`, editors, and REPLs run in the same child pty that the user sees. The broker detects common terminal-input waits with fd/pgrp/wchan checks and returns immediately without killing the program.
+
+The user can interact directly in the pane. The agent can also send explicit input with `shellgate_input`, which writes through the broker socket to the child pty and returns the output delta captured after that input. This is not tmux attach and does not use `tmux send-keys`.
+
+When no interactive foreground process is detected, `shellgate_input` returns `sent:false` and does not write to the idle shell. Use `force:true` only when intentionally sending raw input to the managed shell.
+
+`bash/read/write/edit` should not be used concurrently against the same managed shell while the user is actively driving an interactive full-screen or line-oriented program.
+
+### Command history suppression is best-effort
+
+Broker `--history off` is shell-agnostic. It prefixes generated ShellGate transaction lines with a leading space and does not set zsh, bash, or fish-specific options. Shells that are not configured to ignore leading-space history entries may still persist those internal lines. Stronger guarantees require shell-specific adapters.
+
+### `/shellgate off` stops the active broker
+
+`/shellgate off` clears ShellGate routing and asks the active broker to shut down. Broker shutdown sends `SIGHUP` to the managed child shell and removes the broker socket. If a foreground program is running inside that child shell, it is part of the managed shell session and may also receive hangup behavior from the pty/session.
+
+### `exit` exits the child shell
+
+A direct `exit` in broker mode exits the managed child shell. Depending on the broker state, this can end the broker session for that pane. To test an exit code without ending the shell, use a subshell:
+
+```sh
+( exit 7 )
+bash -lc 'exit 7'
+```

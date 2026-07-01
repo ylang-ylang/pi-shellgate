@@ -1,7 +1,7 @@
 {
   "name": "pi-shellgate",
   "version": "0.3.0",
-  "description": "ShellGate extension for pi: route bash/read/write/edit through SSH, tmux, SSH tmux, or Docker-through-tmux backends.",
+  "description": "ShellGate extension for pi: route bash/read/write/edit through SSH or broker-managed tmux child-shell backends.",
   "keywords": [
     "pi-package",
     "pi-extension",
