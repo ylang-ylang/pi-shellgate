@@ -378,12 +378,13 @@ async function startManagedBroker(host: string | undefined, target: string, cwd:
 async function adoptManagedBroker(host: string | undefined, target: string, cwd: string, socketPath: string): Promise<void> {
 	const broker = await managedBrokerCommand(host);
 	const launchPath = managedLaunchScriptPath(target);
+	const launchCommand = `/bin/sh ${shellQuote(launchPath)}`;
 	const launchScript = `#!/bin/sh\nexec ${broker} --socket ${shellQuote(socketPath)} --cwd ${shellQuote(cwd)} --shell "\${SHELL:-/bin/sh}" --history off\n`;
-	await runHostChecked(host, `cat > ${shellQuote(launchPath)} && chmod 700 ${shellQuote(launchPath)}`, {
+	await runHostChecked(host, `cat > ${shellQuote(launchPath)} && chmod 600 ${shellQuote(launchPath)}`, {
 		input: launchScript,
 		timeout: DEFAULT_CONNECT_TIMEOUT_SECONDS,
 	});
-	await runHostChecked(host, `rm -f ${shellQuote(socketPath)}; tmux send-keys -t ${shellQuote(target)} C-c; tmux send-keys -t ${shellQuote(target)} -l ${shellQuote(launchPath)}; tmux send-keys -t ${shellQuote(target)} Enter`, { timeout: DEFAULT_CONNECT_TIMEOUT_SECONDS });
+	await runHostChecked(host, `rm -f ${shellQuote(socketPath)}; tmux send-keys -t ${shellQuote(target)} C-c; tmux send-keys -t ${shellQuote(target)} -l ${shellQuote(launchCommand)}; tmux send-keys -t ${shellQuote(target)} Enter`, { timeout: DEFAULT_CONNECT_TIMEOUT_SECONDS });
 }
 
 async function respawnManagedBroker(host: string | undefined, target: string, cwd: string, socketPath: string): Promise<void> {

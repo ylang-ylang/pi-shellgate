@@ -56,7 +56,8 @@ Equivalent:
 
 Expected:
 
-- The existing pane shell runs a short launcher such as `/tmp/shellgate-launch-_88.sh`.
+- The existing pane shell starts the short launcher through `/bin/sh`, for example `/bin/sh /tmp/shellgate-launch-_88.sh`.
+- The launcher does not require execute permission on `/tmp`, so adopt works when `/tmp` is mounted `noexec`.
 - The launcher execs `shellgate-broker.py` as the foreground program.
 - The broker inherits exported env and `$SHELL` from the original pane shell.
 - The original pane shell is no longer the command execution backend.
